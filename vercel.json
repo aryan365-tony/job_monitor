@@ -1,10 +1,4 @@
 {
-  "functions": {
-    "/api/parse-jobs": {
-      "memory": 128,
-      "maxDuration": 60
-    }
-  },
   "cron": [
     {
       "path": "/api/parse-jobs",
