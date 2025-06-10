@@ -1,5 +1,5 @@
 {
-  "cron": [
+  "crons": [
     {
       "path": "/api/parse-jobs",
       "schedule": "0 7 * * *"
