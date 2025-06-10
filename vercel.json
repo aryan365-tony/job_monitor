@@ -1,14 +1,8 @@
 {
-  "functions": {
-    "api/parse-jobs.ts": {
-      "memory": 128,
-      "maxDuration": 60
-    }
-  },
   "crons": [
     {
       "path": "/api/parse-jobs",
-      "schedule": "0 * * * *"
+      "schedule": "0 7 * * *"
     }
   ]
 }
