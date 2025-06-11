@@ -2,8 +2,9 @@ export interface Company {
   id: string;
   name: string;
   careers_url: string;
-  selectors?: Record<string, any> | null;
-  last_scraped: string | null;   // <— new field
+  api_url?: string | null;
+  notes?: string | null;
+  last_scraped?: string | null;
 }
 
 

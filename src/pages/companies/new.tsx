@@ -1,13 +1,14 @@
+// pages/companies/new.tsx
 import { useState } from 'react';
 import { useRouter } from 'next/router';
 import { supabase } from '@/lib/supabase';
-import styles from './NewPage.module.css';
+import styles from '@/styles/AddCompanyPage.module.css';
 
 export default function AddCompanyPage() {
   const router = useRouter();
-
   const [name, setName] = useState('');
   const [careersUrl, setCareersUrl] = useState('');
+  const [apiUrl, setApiUrl] = useState('');      // optional API URL
   const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -24,20 +25,23 @@ export default function AddCompanyPage() {
     }
 
     setLoading(true);
-
     const { error: supabaseError } = await supabase
       .from('companies')
-      .insert([{ name: name.trim(), careers_url: careersUrl.trim(), notes: notes.trim() }]);
-
+      .insert([{
+        name: name.trim(),
+        careers_url: careersUrl.trim(),
+        api_url: apiUrl.trim() || null,
+        notes: notes.trim() || null,
+      }]);
     setLoading(false);
 
     if (supabaseError) {
       setError(supabaseError.message);
     } else {
       setSuccess(true);
-      setName('');
-      setCareersUrl('');
-      setNotes('');
+      setName(''); setCareersUrl(''); setApiUrl(''); setNotes('');
+      // optional redirect after delay:
+      // setTimeout(() => router.push('/companies'), 1500);
     }
   }
 
@@ -45,52 +49,67 @@ export default function AddCompanyPage() {
     <div className={styles.container}>
       <form onSubmit={handleSubmit} className={styles.formWrapper}>
         <h1 className={styles.heading}>Add New Company</h1>
-
         {error && <p className={styles.error}>{error}</p>}
         {success && <p className={styles.success}>Company added successfully!</p>}
 
-        <label htmlFor="name" className={styles.label}>
-          Company Name <span style={{ color: '#ff6b6b' }}>*</span>
-        </label>
-        <input
-          id="name"
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          className={styles.input}
-          placeholder="e.g. OpenAI"
-          required
-        />
+        <div className={styles.formGroup}>
+          <label htmlFor="name" className={styles.label}>
+            Company Name <span className={styles.required}>*</span>
+          </label>
+          <input
+            id="name"
+            type="text"
+            value={name}
+            onChange={e => setName(e.target.value)}
+            className={styles.input}
+            placeholder="e.g. OpenAI"
+            required
+          />
+        </div>
 
-        <label htmlFor="careersUrl" className={styles.label}>
-          Careers Page URL <span style={{ color: '#ff6b6b' }}>*</span>
-        </label>
-        <input
-          id="careersUrl"
-          type="url"
-          value={careersUrl}
-          onChange={(e) => setCareersUrl(e.target.value)}
-          className={styles.input}
-          placeholder="https://openai.com/careers"
-          required
-        />
+        <div className={styles.formGroup}>
+          <label htmlFor="careersUrl" className={styles.label}>
+            Careers Page URL <span className={styles.required}>*</span>
+          </label>
+          <input
+            id="careersUrl"
+            type="url"
+            value={careersUrl}
+            onChange={e => setCareersUrl(e.target.value)}
+            className={styles.input}
+            placeholder="https://company.com/careers"
+            required
+          />
+        </div>
 
-        <label htmlFor="notes" className={styles.label}>Notes (Optional)</label>
-        <textarea
-          id="notes"
-          value={notes}
-          onChange={(e) => setNotes(e.target.value)}
-          className={styles.textarea}
-          rows={3}
-          placeholder="Additional info about the company"
-        />
+        <div className={styles.formGroup}>
+          <label htmlFor="apiUrl" className={styles.label}>
+            Jobs API URL (optional)
+          </label>
+          <input
+            id="apiUrl"
+            type="url"
+            value={apiUrl}
+            onChange={e => setApiUrl(e.target.value)}
+            className={styles.input}
+            placeholder="https://company.com/api/jobs"
+          />
+        </div>
 
-        <button
-          type="submit"
-          disabled={loading}
-          className={styles.button}
-        >
-          {loading ? 'Adding...' : 'Add Company'}
+        <div className={styles.formGroup}>
+          <label htmlFor="notes" className={styles.label}>Notes (optional)</label>
+          <textarea
+            id="notes"
+            value={notes}
+            onChange={e => setNotes(e.target.value)}
+            className={styles.textarea}
+            rows={3}
+            placeholder="Any extra info"
+          />
+        </div>
+
+        <button type="submit" disabled={loading} className={styles.btnPrimary}>
+          {loading ? 'Adding…' : 'Add Company'}
         </button>
       </form>
     </div>
