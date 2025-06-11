@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '@lib/supabase';
 import type { Company } from '@/types';
+import styles from './IndexPage.module.css';
 
 export default function CompaniesPage() {
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -18,26 +19,23 @@ export default function CompaniesPage() {
   }, []);
 
   return (
-    <div className="p-6 max-w-2xl mx-auto">
-      <h1 className="text-3xl font-bold mb-6">Companies</h1>
-      <ul className="space-y-4">
+    <div className={styles.container}>
+      <h1 className={styles.heading}>Companies</h1>
+      <div className={styles.list}>
         {companies.map((c) => (
-          <li
-            key={c.id}
-            className="border p-4 rounded hover:shadow transition"
-          >
+          <div key={c.id} className={styles.companyCard}>
             <a
               href={c.careers_url}
               target="_blank"
               rel="noopener noreferrer"
-              className="block text-lg font-semibold"
+              className={styles.companyLink}
             >
-              {c.name}
+              <div className={styles.companyName}>{c.name}</div>
             </a>
-            <p className="text-sm text-gray-600">{c.careers_url}</p>
-          </li>
+            <p className={styles.companyUrl}>{c.careers_url}</p>
+          </div>
         ))}
-      </ul>
+      </div>
     </div>
   );
 }

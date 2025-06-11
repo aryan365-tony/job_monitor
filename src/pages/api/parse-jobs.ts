@@ -1,11 +1,24 @@
-// src/pages/api/parse-jobs.ts
+// pages/api/parse-jobs.ts
+
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { Groq } from 'groq-sdk';
 import { supabase } from '@/lib/supabase';
 import * as cheerio from 'cheerio';
+import nodemailer from 'nodemailer';
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
 const MODEL = process.env.GROQ_MODEL!;
+
+// Configure Nodemailer transporter
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST,
+  port: Number(process.env.EMAIL_PORT),
+  secure: false,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
 
 interface JobParsed {
   url: string;
@@ -15,11 +28,12 @@ interface JobParsed {
   summary?: string | null;
 }
 
+// chunk size to stay under token limit
 const CHUNK_SIZE = 25_000;
 
 function buildBatchPrompt(htmlChunk: string) {
   return `
-You are an expert web scraper and JSON formatter. From this HTML snippet, extract *all* job postings.
+You are an expert job scraper and JSON formatter. From this HTML snippet, extract *all* job postings.
 For each, return exactly these keys:
 - url
 - title
@@ -64,22 +78,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     const cutoff = new Date(Date.now() - 3600_000).toISOString();
-    const results: Array<{ company: string; jobId: string }> = [];
+    const insertedJobs: Array<{
+      company: string;
+      title: string | null;
+      url: string;
+      posted_date: string | null;
+    }> = [];
 
     for (const c of companies) {
-      // 2) Get count of existing jobs for this company
+      // count existing
       const { count } = await supabase
         .from('job_posts')
         .select('id', { head: true, count: 'exact' })
         .eq('company_id', c.id);
       const hasJobs = (count ?? 0) > 0;
+      if (hasJobs && c.last_scraped && c.last_scraped >= cutoff) continue;
 
-      // Skip if it already has jobs and was scraped recently
-      if (hasJobs && c.last_scraped && c.last_scraped >= cutoff) {
-        continue;
-      }
-
-      // 3) Fetch and filter the page HTML
+      // fetch and filter
       let html: string;
       try {
         const resp = await fetch(c.careers_url);
@@ -87,86 +102,102 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const rawHtml = await resp.text();
         const $ = cheerio.load(rawHtml);
         html = $('body').html() || '';
-      } catch (e) {
-        console.error(`Fetch failed for ${c.name}:`, e);
+      } catch {
         continue;
       }
 
-      // 4) Chunk + LLM parse
+      // chunk & parse
       const jobsAccumulator: JobParsed[] = [];
       for (let offset = 0; offset < html.length; offset += CHUNK_SIZE) {
         const chunk = html.slice(offset, offset + CHUNK_SIZE);
         let raw: string;
         try {
-          const completion = await groq.chat.completions.create({
+          const comp = await groq.chat.completions.create({
             model: MODEL,
             messages: [{ role: 'user', content: buildBatchPrompt(chunk) }],
           });
-          raw = completion.choices[0]?.message?.content || '';
-        } catch (e) {
-          console.error(`GROQ AI parse failed for ${c.name} chunk at ${offset}:`, e);
+          raw = comp.choices[0]?.message?.content || '';
+        } catch {
           break;
         }
-
         const cleaned = cleanJSON(raw);
         if (cleaned.startsWith('[')) {
           try {
             const parsed = JSON.parse(cleaned) as JobParsed[];
-            if (Array.isArray(parsed)) jobsAccumulator.push(...parsed);
-          } catch (e) {
-            console.warn(`JSON parse failed for chunk at ${offset}:`, e);
+            jobsAccumulator.push(...parsed);
+          } catch {
+            /* skip */
           }
         }
       }
 
-      // 5) Deduplicate within the batch
-      const uniqueJobs = Array.from(
-        jobsAccumulator.reduce((map, job) => {
-          if (job.url) map.set(job.url, job);
-          return map;
+      // dedupe
+      const unique = Array.from(
+        jobsAccumulator.reduce((m, job) => {
+          if (job.url) m.set(job.url, job);
+          return m;
         }, new Map<string, JobParsed>()).values()
       );
 
-      // 6) Fetch existing URLs to filter out inserts
+      // existing URLs
       const { data: existing } = await supabase
         .from('job_posts')
         .select('url')
         .eq('company_id', c.id);
       const seen = new Set(existing?.map((r) => r.url));
 
-      // 7) Insert only new postings
-      for (const job of uniqueJobs) {
+      // insert new
+      for (const job of unique) {
         if (!job.url || seen.has(job.url)) continue;
-        try {
-          const { data: ins, error: ie } = await supabase
-            .from('job_posts')
-            .insert({
-              company_id: c.id,
-              company_name: c.name,
-              url: job.url,
-              title: job.title ?? null,
-              location: job.location ?? null,
-              posted_date: job.posted_date ?? null,
-              summary: job.summary ?? null,
-              seen_at: new Date().toISOString(),
-            })
-            .select('id')
-            .single();
-          if (ie) throw ie;
-          results.push({ company: c.name, jobId: ins.id });
-        } catch (e) {
-          console.error(`Insert failed for ${job.url}:`, e);
+        const { data: ins, error: ie } = await supabase
+          .from('job_posts')
+          .insert({
+            company_id: c.id,
+            company_name: c.name,
+            url: job.url,
+            title: job.title ?? null,
+            location: job.location ?? null,
+            posted_date: job.posted_date ?? null,
+            summary: job.summary ?? null,
+            seen_at: new Date().toISOString(),
+          })
+          .select('title, url, posted_date')
+          .single();
+        if (!ie && ins) {
+          insertedJobs.push({
+            company: c.name,
+            title: ins.title,
+            url: ins.url,
+            posted_date: ins.posted_date,
+          });
         }
       }
 
-      // 8) Update last_scraped
+      // update last_scraped
       await supabase
         .from('companies')
         .update({ last_scraped: new Date().toISOString() })
         .eq('id', c.id);
     }
 
-    return res.status(200).json({ message: 'Batch scrape complete', results });
+    // 2) Send email if new jobs found
+    if (insertedJobs.length > 0) {
+      const lines = insertedJobs.map(
+        (j) =>
+          `Company: ${j.company}\nTitle: ${j.title}\nURL: ${j.url}\nPosted: ${
+            j.posted_date ?? 'Unknown'
+          }\n`
+      ).join('\n');
+
+      await transporter.sendMail({
+        from: `"Notifier" <${process.env.EMAIL_USER}>`,
+        to: process.env.NOTIFY_EMAIL,
+        subject: `New Jobs Found: ${insertedJobs.length}`,
+        text: `The following new jobs were found:\n\n${lines}`,
+      });
+    }
+
+    return res.status(200).json({ message: 'Done', newCount: insertedJobs.length });
   } catch (err: any) {
     console.error('parse-jobs error:', err);
     return res.status(500).json({ error: err.message });

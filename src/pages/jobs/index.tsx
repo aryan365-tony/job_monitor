@@ -14,12 +14,11 @@ type Job = {
   seen_at: string;
 };
 
-// Use seen_at date to determine if the job is new (within last 2 days)
-function isNew(seenAt: string): boolean {
-  if (!seenAt) return false;
-  const seenDate = new Date(seenAt);
+function isNew(postedDate: string | null): boolean {
+  if (!postedDate) return false;
+  const posted = new Date(postedDate);
   const now = new Date();
-  const diffTime = now.getTime() - seenDate.getTime();
+  const diffTime = now.getTime() - posted.getTime();
   const diffDays = diffTime / (1000 * 60 * 60 * 24);
   return diffDays <= 2;
 }
@@ -43,15 +42,18 @@ export default function JobsPage() {
           posted_date,
           summary,
           seen_at
-        `)
-        .order('seen_at', { ascending: false })
-        .limit(50);
+        `);
 
       if (error) {
         console.error('Error fetching jobs:', error);
         setJobs([]);
       } else {
-        setJobs(data ?? []);
+        const sorted = (data ?? []).sort((a, b) => {
+          const dateA = new Date(a.posted_date || a.seen_at).getTime();
+          const dateB = new Date(b.posted_date || b.seen_at).getTime();
+          return dateB - dateA;
+        });
+        setJobs(sorted);
       }
       setLoading(false);
     }
@@ -103,7 +105,7 @@ export default function JobsPage() {
               <span className={styles.postedDate}>
                 {job.posted_date
                   ? `Posted: ${new Date(job.posted_date).toLocaleDateString()}`
-                  : 'Posted: Unknown'}
+                  : `Seen: ${new Date(job.seen_at).toLocaleDateString()}`}
               </span>
               <span className={styles.viewButton}>View</span>
             </div>

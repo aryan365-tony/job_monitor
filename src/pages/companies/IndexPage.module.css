@@ -1,0 +1,50 @@
+.container {
+  background-color: #0a1128;
+  color: #f0f4f8;
+  min-height: 100vh;
+  padding: 2rem;
+  font-family: 'Segoe UI', sans-serif;
+}
+
+.heading {
+  font-size: 2rem;
+  font-weight: bold;
+  margin-bottom: 2rem;
+  text-align: center;
+  color: #64ffda;
+}
+
+.list {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.companyCard {
+  background-color: #112240;
+  border: 1px solid #1f4068;
+  padding: 1.2rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  transition: all 0.2s ease;
+}
+
+.companyCard:hover {
+  box-shadow: 0 4px 12px rgba(0, 255, 255, 0.1);
+}
+
+.companyName {
+  font-size: 1.2rem;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.companyLink {
+  text-decoration: none;
+  color: #64ffda;
+}
+
+.companyUrl {
+  font-size: 0.9rem;
+  color: #cccccc;
+  margin-top: 0.3rem;
+}
