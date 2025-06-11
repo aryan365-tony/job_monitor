@@ -1,28 +1,31 @@
-// src/pages/jobs/index.tsx
 import { useEffect, useState } from 'react';
 import { supabase } from '@/lib/supabase';
+import styles from '@/styles/JobsPage.module.css';
 
-interface Company {
-  id: string;
-  name: string;
-  careers_url: string;
-  selectors?: Record<string, any>;
-}
-
-interface JobPost {
+type Job = {
   id: string;
   company_id: string;
+  company_name: string;
   url: string;
   title: string | null;
   location: string | null;
   posted_date: string | null;
   summary: string | null;
-  seen_at: string | null;
-  companies?: Company[]; // Supabase returns as array
+  seen_at: string;
+};
+
+// Use seen_at date to determine if the job is new (within last 2 days)
+function isNew(seenAt: string): boolean {
+  if (!seenAt) return false;
+  const seenDate = new Date(seenAt);
+  const now = new Date();
+  const diffTime = now.getTime() - seenDate.getTime();
+  const diffDays = diffTime / (1000 * 60 * 60 * 24);
+  return diffDays <= 2;
 }
 
 export default function JobsPage() {
-  const [jobs, setJobs] = useState<JobPost[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -30,14 +33,25 @@ export default function JobsPage() {
       setLoading(true);
       const { data, error } = await supabase
         .from('job_posts')
-        .select('*, companies(*)')
-        .order('posted_date', { ascending: false });
+        .select(`
+          id,
+          company_id,
+          company_name,
+          url,
+          title,
+          location,
+          posted_date,
+          summary,
+          seen_at
+        `)
+        .order('seen_at', { ascending: false })
+        .limit(50);
 
       if (error) {
         console.error('Error fetching jobs:', error);
         setJobs([]);
-      } else if (data) {
-        setJobs(data);
+      } else {
+        setJobs(data ?? []);
       }
       setLoading(false);
     }
@@ -46,46 +60,55 @@ export default function JobsPage() {
   }, []);
 
   return (
-    <div className="p-6 max-w-4xl mx-auto">
-      <h1 className="text-3xl font-bold mb-6">Job Updates</h1>
+    <div className={styles.container}>
+      <h1 className={styles.title}>Latest Job Opportunities</h1>
 
-      {loading && <p>Loading jobs...</p>}
+      {loading && (
+        <p style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+          Loading job posts…
+        </p>
+      )}
 
-      {!loading && jobs.length === 0 && <p>No jobs found.</p>}
+      {!loading && jobs.length === 0 && (
+        <p style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+          No job posts found.
+        </p>
+      )}
 
-      <div className="space-y-6">
-        {jobs.map((job) => {
-          // companies is an array with one company due to relation
-          const company = job.companies?.[0];
-          return (
-            <div
-              key={job.id}
-              className="border rounded p-4 shadow hover:shadow-lg transition"
-            >
-              <h2 className="text-xl font-semibold">{job.title || 'No title'}</h2>
-              <p className="text-sm text-gray-600">
-                <strong>Company:</strong> {company?.name || 'Unknown'}
+      <div className={styles.grid}>
+        {jobs.map((job) => (
+          <a
+            key={job.id}
+            href={job.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={styles.card}
+          >
+            <div className={styles.cardContent}>
+              <h2 className={styles.cardTitle}>
+                {job.title ?? 'Untitled Position'}
+                {isNew(job.seen_at) && (
+                  <span className={styles.newTag}>New</span>
+                )}
+              </h2>
+              <p className={styles.cardCompany}>
+                {job.company_name}
+                {job.location && <> · {job.location}</>}
               </p>
-              <p className="text-sm text-gray-600">
-                <strong>Location:</strong> {job.location || 'Not specified'}
+              <p className={styles.cardSummary}>
+                {job.summary ?? 'No description available.'}
               </p>
-              <p className="text-sm text-gray-600">
-                <strong>Posted:</strong> {job.posted_date || 'Unknown'}
-              </p>
-              <p className="mt-2">{job.summary || 'No description available.'}</p>
-              {job.url && (
-                <a
-                  href={job.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-blue-600 hover:underline mt-2 block"
-                >
-                  View Job Post
-                </a>
-              )}
             </div>
-          );
-        })}
+            <div className={styles.cardFooter}>
+              <span className={styles.postedDate}>
+                {job.posted_date
+                  ? `Posted: ${new Date(job.posted_date).toLocaleDateString()}`
+                  : 'Posted: Unknown'}
+              </span>
+              <span className={styles.viewButton}>View</span>
+            </div>
+          </a>
+        ))}
       </div>
     </div>
   );

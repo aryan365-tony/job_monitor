@@ -1,0 +1,117 @@
+.container {
+  background-color: #0a1128;
+  color: #cbd5e1;
+  min-height: 100vh;
+  padding: 2rem;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.title {
+  font-size: 3rem;
+  font-weight: 800;
+  margin-bottom: 3rem;
+  text-align: center;
+  background: linear-gradient(to right, #6366f1, #a855f7, #ec4899);
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+.grid {
+  display: grid;
+  gap: 2rem;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--card-bg);
+  border: 2px solid var(--border-color);
+  background-color: #112240;
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(28, 52, 91, 0.7);
+  transition: all 0.3s ease;
+  text-decoration: none;
+  color: var(--text-main);
+}
+
+.card:hover {
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 1);
+  border-color: var(--accent);
+}
+
+.cardContent {
+  flex: 1;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.cardTitle {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  color: var(--text-main);
+}
+
+.cardCompany {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--accent);
+  margin-bottom: 0.75rem;
+}
+
+.cardSummary {
+  color: var(--text-muted);
+  margin-bottom: 1rem;
+  flex-grow: 1;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
+.cardFooter {
+  padding: 1rem 1.5rem;
+  background: #111827; /* slightly darker */
+  border-top: 1px solid var(--border-color);
+  border-bottom-left-radius: 1rem;
+  border-bottom-right-radius: 1rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.postedDate {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.viewButton {
+  padding: 0.25rem 0.75rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  background: #2563eb;
+  color: var(--new-tag-text);
+  border-radius: 9999px;
+  transition: background 0.2s ease;
+  cursor: pointer;
+}
+
+.card:hover .viewButton {
+  background: #3b82f6;
+}
+
+.newTag {
+  padding: 0.25rem 0.75rem;
+  background-color: #2563eb;  /* bright blue */
+  color: white;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 9999px;
+  margin-left: 0.5rem;
+  user-select: none;
+  white-space: nowrap;
+}
+

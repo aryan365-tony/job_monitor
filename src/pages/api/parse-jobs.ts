@@ -1,12 +1,12 @@
+// src/pages/api/parse-jobs.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
-import Groq from 'groq-sdk';
+import { Groq } from 'groq-sdk';
 import { supabase } from '@/lib/supabase';
 import * as cheerio from 'cheerio';
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
 const MODEL = process.env.GROQ_MODEL!;
 
-// Define a type for the parsed job objects
 interface JobParsed {
   url: string;
   title?: string | null;
@@ -15,7 +15,6 @@ interface JobParsed {
   summary?: string | null;
 }
 
-// Approximate chunk size to stay within token limits
 const CHUNK_SIZE = 25_000;
 
 function buildBatchPrompt(htmlChunk: string) {
@@ -55,35 +54,45 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    const cutoff = new Date(Date.now() - 3600_000).toISOString();
+    // 1) Fetch all companies
     const { data: companies, error: compErr } = await supabase
       .from('companies')
-      .select('id, name, careers_url, last_scraped')
-      .or(`last_scraped.is.null,last_scraped.lt.${cutoff}`);
+      .select('id, name, careers_url, last_scraped');
     if (compErr) throw compErr;
     if (!companies?.length) {
-      return res.status(200).json({ message: 'No companies due for scraping' });
+      return res.status(200).json({ message: 'No companies found' });
     }
 
+    const cutoff = new Date(Date.now() - 3600_000).toISOString();
     const results: Array<{ company: string; jobId: string }> = [];
 
-    for (const company of companies) {
-      let html: string;
-      try {
-        const resp = await fetch(company.careers_url);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const rawHtml = await resp.text();
+    for (const c of companies) {
+      // 2) Get count of existing jobs for this company
+      const { count } = await supabase
+        .from('job_posts')
+        .select('id', { head: true, count: 'exact' })
+        .eq('company_id', c.id);
+      const hasJobs = (count ?? 0) > 0;
 
-        // Filter with Cheerio
-        const $ = cheerio.load(rawHtml);
-        const bodyHtml = $('body').html() || '';
-        html = bodyHtml;
-      } catch (e) {
-        console.error(`Fetch failed for ${company.name}:`, e);
+      // Skip if it already has jobs and was scraped recently
+      if (hasJobs && c.last_scraped && c.last_scraped >= cutoff) {
         continue;
       }
 
-      // Slice HTML into manageable chunks
+      // 3) Fetch and filter the page HTML
+      let html: string;
+      try {
+        const resp = await fetch(c.careers_url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const rawHtml = await resp.text();
+        const $ = cheerio.load(rawHtml);
+        html = $('body').html() || '';
+      } catch (e) {
+        console.error(`Fetch failed for ${c.name}:`, e);
+        continue;
+      }
+
+      // 4) Chunk + LLM parse
       const jobsAccumulator: JobParsed[] = [];
       for (let offset = 0; offset < html.length; offset += CHUNK_SIZE) {
         const chunk = html.slice(offset, offset + CHUNK_SIZE);
@@ -95,21 +104,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           });
           raw = completion.choices[0]?.message?.content || '';
         } catch (e) {
-          console.error(`GROQ AI parse failed for ${company.name} chunk at ${offset}:`, e);
+          console.error(`GROQ AI parse failed for ${c.name} chunk at ${offset}:`, e);
           break;
         }
 
-        try {
-          const parsedChunk = JSON.parse(cleanJSON(raw)) as JobParsed[];
-          if (Array.isArray(parsedChunk)) {
-            jobsAccumulator.push(...parsedChunk);
+        const cleaned = cleanJSON(raw);
+        if (cleaned.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(cleaned) as JobParsed[];
+            if (Array.isArray(parsed)) jobsAccumulator.push(...parsed);
+          } catch (e) {
+            console.warn(`JSON parse failed for chunk at ${offset}:`, e);
           }
-        } catch (e) {
-          console.warn(`JSON parse failed for chunk at ${offset}:`, e);
         }
       }
 
-      // Deduplicate within the batch by URL
+      // 5) Deduplicate within the batch
       const uniqueJobs = Array.from(
         jobsAccumulator.reduce((map, job) => {
           if (job.url) map.set(job.url, job);
@@ -117,21 +127,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         }, new Map<string, JobParsed>()).values()
       );
 
-      // Fetch existing URLs for this company
+      // 6) Fetch existing URLs to filter out inserts
       const { data: existing } = await supabase
         .from('job_posts')
         .select('url')
-        .eq('company_id', company.id);
+        .eq('company_id', c.id);
       const seen = new Set(existing?.map((r) => r.url));
 
-      // Insert only truly new jobs
+      // 7) Insert only new postings
       for (const job of uniqueJobs) {
         if (!job.url || seen.has(job.url)) continue;
         try {
-          const { data: inserted, error: insertErr } = await supabase
+          const { data: ins, error: ie } = await supabase
             .from('job_posts')
             .insert({
-              company_id: company.id,
+              company_id: c.id,
+              company_name: c.name,
               url: job.url,
               title: job.title ?? null,
               location: job.location ?? null,
@@ -141,18 +152,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             })
             .select('id')
             .single();
-          if (insertErr) throw insertErr;
-          results.push({ company: company.name, jobId: inserted.id });
+          if (ie) throw ie;
+          results.push({ company: c.name, jobId: ins.id });
         } catch (e) {
           console.error(`Insert failed for ${job.url}:`, e);
         }
       }
 
-      // Update last_scraped timestamp
+      // 8) Update last_scraped
       await supabase
         .from('companies')
         .update({ last_scraped: new Date().toISOString() })
-        .eq('id', company.id);
+        .eq('id', c.id);
     }
 
     return res.status(200).json({ message: 'Batch scrape complete', results });
