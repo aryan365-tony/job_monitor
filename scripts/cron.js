@@ -7,7 +7,7 @@ import nodemailer from 'nodemailer';
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL;
-const CHUNK_SIZE = 25_000;
+const CHUNK_SIZE = 18_000;
 
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
