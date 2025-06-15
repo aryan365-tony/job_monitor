@@ -23,8 +23,8 @@ jobs:
       - name: Run cron script
         run: npm run cron
         env:
-          SUPABASE_URL:  ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
-          SUPABASE_KEY:  ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_SUPABASE_URL:  ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY:  ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
           GROQ_API_KEY:  ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL:    ${{ secrets.GROQ_MODEL }}
           EMAIL_HOST:    ${{ secrets.EMAIL_HOST }}
