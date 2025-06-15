@@ -3,6 +3,7 @@ name: Daily Job Scraper & Notifier
 on:
   schedule:
     - cron: '0 8 * * *'  # runs daily at 08:00 UTC
+  workflow_dispatch:
 
 jobs:
   scrape_and_notify:
