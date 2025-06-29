@@ -19,21 +19,9 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// --- URL Normalization Utility ---
-function normalizeUrl(url) {
-  try {
-    const u = new URL(url.trim().toLowerCase());
-    u.hash = '';
-    // Remove common tracking parameters
-    u.searchParams.forEach((_, key) => {
-      if (key.startsWith('utm_')) u.searchParams.delete(key);
-    });
-    // Remove trailing slash
-    u.pathname = u.pathname.replace(/\/+$/, '');
-    return u.toString();
-  } catch {
-    return url.trim().toLowerCase();
-  }
+// Loosened normalization: only lowercases and trims
+function normalizeUrlLoosely(url) {
+  return url ? url.trim().toLowerCase() : '';
 }
 
 function buildBatchPrompt(content) {
@@ -129,24 +117,26 @@ async function main() {
         }
       }
     }
+    console.log(`🔎 Parsed ${parsedAccumulator.length} jobs for ${c.name}`);
 
-    // 4. Deduplicate by normalized URL within this batch
+    // 4. Loosened deduplication by normalized URL (lowercase + trim only)
     const jobMap = new Map();
     for (const job of parsedAccumulator) {
       if (!job.url) continue;
-      const normUrl = normalizeUrl(job.url);
+      const normUrl = normalizeUrlLoosely(job.url);
       if (!jobMap.has(normUrl)) {
         jobMap.set(normUrl, { ...job, url: normUrl });
       }
     }
     const uniqueJobs = Array.from(jobMap.values());
+    console.log(`🗂️ ${uniqueJobs.length} unique jobs for ${c.name} after deduplication`);
 
     // 5. Fetch and normalize existing URLs
     const { data: existing } = await supabase
       .from('job_posts')
       .select('url')
       .eq('company_id', c.id);
-    const seen = new Set((existing || []).map(r => normalizeUrl(r.url)));
+    const seen = new Set((existing || []).map(r => normalizeUrlLoosely(r.url)));
 
     // 6. Insert new jobs, handling unique constraint
     for (const job of uniqueJobs) {
@@ -184,7 +174,6 @@ async function main() {
           console.error(`Insert error for ${c.name}:`, ie);
         }
       } catch (e) {
-        // Some errors may not have a code property
         if (e.code === '23505') {
           continue;
         }
