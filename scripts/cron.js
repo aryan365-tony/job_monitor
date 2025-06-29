@@ -41,8 +41,10 @@ class RateLimiter {
 function estimateTokens(text) {
   return Math.max(1, Math.floor(text.length / 4));
 }
-function splitContentByTokenLimit(content, maxTokensPerRequest) {
-  const chunkSize = maxTokensPerRequest * 4; // 1 token ≈ 4 chars
+
+function splitContentByTokenLimit(content, maxTokensPerRequest, promptOverhead = 200) {
+  const chunkTokenBudget = maxTokensPerRequest - promptOverhead;
+  const chunkSize = chunkTokenBudget * 4; // 1 token ≈ 4 characters
   const chunks = [];
   let start = 0;
   while (start < content.length) {
@@ -59,6 +61,7 @@ const MAX_REQUESTS_PER_MINUTE = 30;
 const MAX_REQUESTS_PER_DAY = 14400;
 const MAX_TOKENS_PER_MINUTE = 15000;
 const MAX_TOKENS_PER_REQUEST = 500;
+const PROMPT_OVERHEAD_TOKENS = 200;
 
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
@@ -109,6 +112,7 @@ function cleanResponse(text) {
   return text.replace(/``````/g, '').trim();
 }
 
+// --- Main Function ---
 async function main() {
   console.log('🔔 Job start:', new Date().toISOString());
 
@@ -152,12 +156,12 @@ async function main() {
       continue;
     }
 
-    // --- Chunk content to fit per-request token budget ---
-    const chunks = splitContentByTokenLimit(rawContent, MAX_TOKENS_PER_REQUEST);
+    const chunks = splitContentByTokenLimit(rawContent, MAX_TOKENS_PER_REQUEST, PROMPT_OVERHEAD_TOKENS);
+    console.log(`🔍 Chunked ${rawContent.length} chars into ${chunks.length} chunks for ${c.name}`);
+    
     const parsedAccumulator = [];
 
     for (const chunk of chunks) {
-      // --- Rate limiting ---
       while (!rateLimiter.canSend()) {
         console.log('⏳ Rate limit reached, waiting...');
         await new Promise(res => setTimeout(res, 1000));
@@ -170,22 +174,22 @@ async function main() {
           model: MODEL,
           messages: [{ role: 'user', content: buildBatchPrompt(chunk) }],
         });
-        llmOutput = comp.choices?.message?.content || '';
+        llmOutput = comp.choices?.[0]?.message?.content || '';
       } catch (e) {
         console.error(`❌ LLM parse failed for ${c.name}:`, e);
         break;
       }
+
       const cleaned = cleanResponse(llmOutput);
       if (cleaned.startsWith('[')) {
         try {
           parsedAccumulator.push(...JSON.parse(cleaned));
         } catch {
-          // ignore JSON errors
+          // Skip malformed JSON
         }
       }
     }
 
-    // Deduplicate with normalized URLs
     const jobMap = new Map();
     for (const job of parsedAccumulator) {
       if (!job.url) continue;
@@ -196,14 +200,12 @@ async function main() {
     }
     const uniqueJobs = Array.from(jobMap.values());
 
-    // Fetch existing URLs and normalize
     const { data: existing } = await supabase
       .from('job_posts')
       .select('url')
       .eq('company_id', c.id);
     const seen = new Set((existing || []).map(r => normalizeUrl(r.url)));
 
-    // Filter new jobs
     const jobsToInsert = uniqueJobs.filter(job => !seen.has(job.url));
 
     if (jobsToInsert.length > 0) {
