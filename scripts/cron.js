@@ -113,7 +113,6 @@ function cleanResponse(text) {
 }
 
 // --- Main Function ---
-// --- Main Function ---
 async function main() {
   console.log('🔔 Job start:', new Date().toISOString());
 
@@ -134,7 +133,6 @@ async function main() {
   const cutoff = new Date(Date.now() - 3600_000).toISOString();
   const newJobs = [];
   const rateLimiter = new RateLimiter(MAX_REQUESTS_PER_MINUTE, MAX_REQUESTS_PER_DAY);
-  const rateLimiter = new RateLimiter(MAX_REQUESTS_PER_MINUTE, MAX_REQUESTS_PER_DAY);
 
   for (const c of companies) {
     if (c.last_scraped && c.last_scraped >= cutoff) {
@@ -147,7 +145,6 @@ async function main() {
       if (c.api_url) {
         const apiResp = await fetch(c.api_url);
         rawContent = await apiResp.text();
-        rawContent = await apiResp.text();
       } else {
         const htmlResp = await fetch(c.careers_url);
         const html = await htmlResp.text();
@@ -159,9 +156,6 @@ async function main() {
       continue;
     }
 
-    const chunks = splitContentByTokenLimit(rawContent, MAX_TOKENS_PER_REQUEST, PROMPT_OVERHEAD_TOKENS);
-    console.log(`🔍 Chunked ${rawContent.length} chars into ${chunks.length} chunks for ${c.name}`);
-    
     const chunks = splitContentByTokenLimit(rawContent, MAX_TOKENS_PER_REQUEST, PROMPT_OVERHEAD_TOKENS);
     console.log(`🔍 Chunked ${rawContent.length} chars into ${chunks.length} chunks for ${c.name}`);
     
@@ -189,19 +183,16 @@ async function main() {
           messages: [{ role: 'user', content: fullPrompt }],
         });
         llmOutput = comp.choices?.[0]?.message?.content || '';
-        llmOutput = comp.choices?.[0]?.message?.content || '';
       } catch (e) {
         console.error(`❌ LLM parse failed for ${c.name}:`, e);
         break;
       }
-
 
       const cleaned = cleanResponse(llmOutput);
       if (cleaned.startsWith('[')) {
         try {
           parsedAccumulator.push(...JSON.parse(cleaned));
         } catch {
-          // Skip malformed JSON
           // Skip malformed JSON
         }
       }
@@ -231,33 +222,7 @@ async function main() {
         .insert(
           jobsToInsert.map(job => ({
             company_id: c.id,
-    const jobsToInsert = uniqueJobs.filter(job => !seen.has(job.url));
-
-    if (jobsToInsert.length > 0) {
-      const { error: insertError } = await supabase
-        .from('job_posts')
-        .insert(
-          jobsToInsert.map(job => ({
-            company_id: c.id,
             company_name: c.name,
-            url: job.url,
-            title: job.title ?? null,
-            location: job.location ?? null,
-            posted_date: job.posted_date ?? null,
-            summary: job.summary ?? null,
-            seen_at: new Date().toISOString(),
-          }))
-        );
-      if (insertError) {
-        console.error(`❌ Insert error for ${c.name}:`, insertError);
-      } else {
-        newJobs.push(...jobsToInsert.map(job => ({
-          company: c.name,
-          title: job.title,
-          url: job.url,
-          posted_date: job.posted_date,
-        })));
-        console.log(`   ➕ Inserted ${jobsToInsert.length} new jobs for ${c.name}`);
             url: job.url,
             title: job.title ?? null,
             location: job.location ?? null,
@@ -288,16 +253,12 @@ async function main() {
   if (newJobs.length) {
     const details = newJobs
       .map(j => `Company: ${j.company}\nTitle: ${j.title}\nURL: ${j.url}\nPosted: ${j.posted_date ?? 'Unknown'}\n`)
-      .map(j => `Company: ${j.company}\nTitle: ${j.title}\nURL: ${j.url}\nPosted: ${j.posted_date ?? 'Unknown'}\n`)
       .join('\n');
     try {
       await transporter.sendMail({
         from: `"Notifier" <${process.env.EMAIL_USER}>`,
         to: process.env.NOTIFY_EMAIL,
-        from: `"Notifier" <${process.env.EMAIL_USER}>`,
-        to: process.env.NOTIFY_EMAIL,
         subject: `New Jobs Found: ${newJobs.length}`,
-        text: `New jobs:\n\n${details}`,
         text: `New jobs:\n\n${details}`,
       });
       console.log('✅ Email sent');
