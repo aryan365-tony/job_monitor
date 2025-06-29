@@ -3,7 +3,7 @@ import * as cheerio from 'cheerio';
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from 'nodemailer';
-import { encode } from 'gpt-3-encoder'; // Token counter
+import { encode, decode } from 'gpt-3-encoder';
 
 // --- Rate Limiter ---
 class RateLimiter {
@@ -35,19 +35,19 @@ class RateLimiter {
   }
 }
 
-// --- Token Utilities ---
-function tokenCount(text) {
-  return encode(text).length;
-}
-
-function splitContentByTokenLimit(content, maxTokensPerRequest, promptOverhead = 300) {
-  const chunkSize = (maxTokensPerRequest - promptOverhead) * 4; // approx 4 chars/token
+function splitContentByTokenLimit(content, maxTokens, promptTokens = 300) {
+  const tokens = encode(content);
   const chunks = [];
   let start = 0;
-  while (start < content.length) {
-    chunks.push(content.slice(start, start + chunkSize));
-    start += chunkSize;
+  const maxTokensPerChunk = maxTokens - promptTokens;
+
+  while (start < tokens.length) {
+    const chunkTokens = tokens.slice(start, start + maxTokensPerChunk);
+    const chunkText = decode(chunkTokens);
+    chunks.push(chunkText);
+    start += maxTokensPerChunk;
   }
+
   return chunks;
 }
 
@@ -86,7 +86,6 @@ function cleanResponse(text) {
   return text.replace(/``````/g, '').trim();
 }
 
-// --- Main Job Function ---
 async function main() {
   console.log('🔔 Job start:', new Date().toISOString());
 
@@ -142,7 +141,7 @@ async function main() {
 
     for (const chunk of chunks) {
       const fullPrompt = buildBatchPrompt(chunk);
-      const totalTokens = tokenCount(fullPrompt);
+      const totalTokens = encode(fullPrompt).length;
       if (totalTokens > MAX_TOKENS_PER_REQUEST) {
         console.warn(`⚠️ Skipping chunk for ${c.name} — ${totalTokens} tokens`);
         continue;
