@@ -3,6 +3,7 @@ import * as cheerio from 'cheerio';
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from 'nodemailer';
+import { encode } from 'gpt-3-encoder'; // ✅ NEW
 
 // --- Rate Limiter ---
 class RateLimiter {
@@ -37,14 +38,14 @@ class RateLimiter {
   }
 }
 
-// --- Token/Chunk Logic ---
-function estimateTokens(text) {
-  return Math.max(1, Math.floor(text.length / 4));
+// --- Token Count & Chunking ---
+function tokenCount(text) {
+  return encode(text).length;
 }
 
-function splitContentByTokenLimit(content, maxTokensPerRequest, promptOverhead = 200) {
+function splitContentByTokenLimit(content, maxTokensPerRequest, promptOverhead = 300) {
   const chunkTokenBudget = maxTokensPerRequest - promptOverhead;
-  const chunkSize = chunkTokenBudget * 4; // 1 token ≈ 4 characters
+  const chunkSize = chunkTokenBudget * 4; // approx 4 characters per token
   const chunks = [];
   let start = 0;
   while (start < content.length) {
@@ -59,9 +60,8 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL;
 const MAX_REQUESTS_PER_MINUTE = 30;
 const MAX_REQUESTS_PER_DAY = 14400;
-const MAX_TOKENS_PER_MINUTE = 15000;
-const MAX_TOKENS_PER_REQUEST = 500;
-const PROMPT_OVERHEAD_TOKENS = 200;
+const MAX_TOKENS_PER_REQUEST = 2000;
+const PROMPT_OVERHEAD_TOKENS = 300;
 
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
@@ -113,6 +113,7 @@ function cleanResponse(text) {
 }
 
 // --- Main Function ---
+// --- Main Function ---
 async function main() {
   console.log('🔔 Job start:', new Date().toISOString());
 
@@ -133,6 +134,7 @@ async function main() {
   const cutoff = new Date(Date.now() - 3600_000).toISOString();
   const newJobs = [];
   const rateLimiter = new RateLimiter(MAX_REQUESTS_PER_MINUTE, MAX_REQUESTS_PER_DAY);
+  const rateLimiter = new RateLimiter(MAX_REQUESTS_PER_MINUTE, MAX_REQUESTS_PER_DAY);
 
   for (const c of companies) {
     if (c.last_scraped && c.last_scraped >= cutoff) {
@@ -144,6 +146,7 @@ async function main() {
     try {
       if (c.api_url) {
         const apiResp = await fetch(c.api_url);
+        rawContent = await apiResp.text();
         rawContent = await apiResp.text();
       } else {
         const htmlResp = await fetch(c.careers_url);
@@ -159,9 +162,20 @@ async function main() {
     const chunks = splitContentByTokenLimit(rawContent, MAX_TOKENS_PER_REQUEST, PROMPT_OVERHEAD_TOKENS);
     console.log(`🔍 Chunked ${rawContent.length} chars into ${chunks.length} chunks for ${c.name}`);
     
+    const chunks = splitContentByTokenLimit(rawContent, MAX_TOKENS_PER_REQUEST, PROMPT_OVERHEAD_TOKENS);
+    console.log(`🔍 Chunked ${rawContent.length} chars into ${chunks.length} chunks for ${c.name}`);
+    
     const parsedAccumulator = [];
 
     for (const chunk of chunks) {
+      const fullPrompt = buildBatchPrompt(chunk);
+      const totalTokens = tokenCount(fullPrompt);
+
+      if (totalTokens > MAX_TOKENS_PER_REQUEST) {
+        console.warn(`⚠️ Skipping chunk for ${c.name} — ${totalTokens} tokens exceeds ${MAX_TOKENS_PER_REQUEST}`);
+        continue;
+      }
+
       while (!rateLimiter.canSend()) {
         console.log('⏳ Rate limit reached, waiting...');
         await new Promise(res => setTimeout(res, 1000));
@@ -172,19 +186,22 @@ async function main() {
       try {
         const comp = await groq.chat.completions.create({
           model: MODEL,
-          messages: [{ role: 'user', content: buildBatchPrompt(chunk) }],
+          messages: [{ role: 'user', content: fullPrompt }],
         });
+        llmOutput = comp.choices?.[0]?.message?.content || '';
         llmOutput = comp.choices?.[0]?.message?.content || '';
       } catch (e) {
         console.error(`❌ LLM parse failed for ${c.name}:`, e);
         break;
       }
 
+
       const cleaned = cleanResponse(llmOutput);
       if (cleaned.startsWith('[')) {
         try {
           parsedAccumulator.push(...JSON.parse(cleaned));
         } catch {
+          // Skip malformed JSON
           // Skip malformed JSON
         }
       }
@@ -214,7 +231,33 @@ async function main() {
         .insert(
           jobsToInsert.map(job => ({
             company_id: c.id,
+    const jobsToInsert = uniqueJobs.filter(job => !seen.has(job.url));
+
+    if (jobsToInsert.length > 0) {
+      const { error: insertError } = await supabase
+        .from('job_posts')
+        .insert(
+          jobsToInsert.map(job => ({
+            company_id: c.id,
             company_name: c.name,
+            url: job.url,
+            title: job.title ?? null,
+            location: job.location ?? null,
+            posted_date: job.posted_date ?? null,
+            summary: job.summary ?? null,
+            seen_at: new Date().toISOString(),
+          }))
+        );
+      if (insertError) {
+        console.error(`❌ Insert error for ${c.name}:`, insertError);
+      } else {
+        newJobs.push(...jobsToInsert.map(job => ({
+          company: c.name,
+          title: job.title,
+          url: job.url,
+          posted_date: job.posted_date,
+        })));
+        console.log(`   ➕ Inserted ${jobsToInsert.length} new jobs for ${c.name}`);
             url: job.url,
             title: job.title ?? null,
             location: job.location ?? null,
@@ -245,12 +288,16 @@ async function main() {
   if (newJobs.length) {
     const details = newJobs
       .map(j => `Company: ${j.company}\nTitle: ${j.title}\nURL: ${j.url}\nPosted: ${j.posted_date ?? 'Unknown'}\n`)
+      .map(j => `Company: ${j.company}\nTitle: ${j.title}\nURL: ${j.url}\nPosted: ${j.posted_date ?? 'Unknown'}\n`)
       .join('\n');
     try {
       await transporter.sendMail({
         from: `"Notifier" <${process.env.EMAIL_USER}>`,
         to: process.env.NOTIFY_EMAIL,
+        from: `"Notifier" <${process.env.EMAIL_USER}>`,
+        to: process.env.NOTIFY_EMAIL,
         subject: `New Jobs Found: ${newJobs.length}`,
+        text: `New jobs:\n\n${details}`,
         text: `New jobs:\n\n${details}`,
       });
       console.log('✅ Email sent');
