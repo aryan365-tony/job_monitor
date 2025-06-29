@@ -3,7 +3,7 @@ import * as cheerio from 'cheerio';
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from 'nodemailer';
-import { encode } from 'gpt-3-encoder'; // ✅ NEW
+import { encode } from 'gpt-3-encoder'; // Token counter
 
 // --- Rate Limiter ---
 class RateLimiter {
@@ -27,25 +27,21 @@ class RateLimiter {
     const now = Date.now();
     if (now - this.minuteStart >= 60 * 1000) this.resetMinute();
     if (now - this.dayStart >= 24 * 60 * 60 * 1000) this.resetDay();
-    return (
-      this.reqThisMinute < this.maxPerMinute &&
-      this.reqToday < this.maxPerDay
-    );
+    return this.reqThisMinute < this.maxPerMinute && this.reqToday < this.maxPerDay;
   }
   record() {
-    this.reqThisMinute += 1;
-    this.reqToday += 1;
+    this.reqThisMinute++;
+    this.reqToday++;
   }
 }
 
-// --- Token Count & Chunking ---
+// --- Token Utilities ---
 function tokenCount(text) {
   return encode(text).length;
 }
 
 function splitContentByTokenLimit(content, maxTokensPerRequest, promptOverhead = 300) {
-  const chunkTokenBudget = maxTokensPerRequest - promptOverhead;
-  const chunkSize = chunkTokenBudget * 4; // approx 4 characters per token
+  const chunkSize = (maxTokensPerRequest - promptOverhead) * 4; // approx 4 chars/token
   const chunks = [];
   let start = 0;
   while (start < content.length) {
@@ -55,24 +51,6 @@ function splitContentByTokenLimit(content, maxTokensPerRequest, promptOverhead =
   return chunks;
 }
 
-// --- Setup ---
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-const MODEL = process.env.GROQ_MODEL;
-const MAX_REQUESTS_PER_MINUTE = 30;
-const MAX_REQUESTS_PER_DAY = 14400;
-const MAX_TOKENS_PER_REQUEST = 2000;
-const PROMPT_OVERHEAD_TOKENS = 300;
-
-const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST,
-  port: Number(process.env.EMAIL_PORT),
-  secure: false,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
-
 function normalizeUrl(url) {
   try {
     const u = new URL(url.trim().toLowerCase());
@@ -80,7 +58,7 @@ function normalizeUrl(url) {
     u.searchParams.forEach((_, key) => {
       if (key.startsWith('utm_')) u.searchParams.delete(key);
     });
-    u.pathname = u.pathname.replace(/\/+$/, '');
+    u.pathname = u.pathname.replace(/\/+$|\/+(?=\?)/g, '');
     return u.toString();
   } catch {
     return url.trim().toLowerCase();
@@ -100,39 +78,49 @@ For each posting, return exactly these keys:
 Return a JSON array of objects—nothing else.
 
 Content:
-\`\`\`
-${content}
-\`\`\`
-
-JSON:
-`;
+\n\n\n${content}\n\n\nJSON:
+  `;
 }
 
 function cleanResponse(text) {
   return text.replace(/``````/g, '').trim();
 }
 
-// --- Main Function ---
+// --- Main Job Function ---
 async function main() {
   console.log('🔔 Job start:', new Date().toISOString());
+
+  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+  const MODEL = process.env.GROQ_MODEL;
+  const MAX_REQUESTS_PER_MINUTE = 30;
+  const MAX_REQUESTS_PER_DAY = 14400;
+  const MAX_TOKENS_PER_REQUEST = 2000;
+  const PROMPT_OVERHEAD_TOKENS = 300;
 
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
   );
 
-  const { data: companies, error: compErr } = await supabase
-    .from('companies')
-    .select('id, name, careers_url, api_url, last_scraped');
+  const transporter = nodemailer.createTransport({
+    host: process.env.EMAIL_HOST,
+    port: Number(process.env.EMAIL_PORT),
+    secure: false,
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS,
+    },
+  });
+
+  const rateLimiter = new RateLimiter(MAX_REQUESTS_PER_MINUTE, MAX_REQUESTS_PER_DAY);
+  const { data: companies, error: compErr } = await supabase.from('companies').select('*');
   if (compErr) {
     console.error('❌ Error fetching companies:', compErr);
     process.exit(1);
   }
-  console.log(`📦 Found ${companies.length} companies`);
 
   const cutoff = new Date(Date.now() - 3600_000).toISOString();
   const newJobs = [];
-  const rateLimiter = new RateLimiter(MAX_REQUESTS_PER_MINUTE, MAX_REQUESTS_PER_DAY);
 
   for (const c of companies) {
     if (c.last_scraped && c.last_scraped >= cutoff) {
@@ -142,59 +130,41 @@ async function main() {
 
     let rawContent = '';
     try {
-      if (c.api_url) {
-        const apiResp = await fetch(c.api_url);
-        rawContent = await apiResp.text();
-      } else {
-        const htmlResp = await fetch(c.careers_url);
-        const html = await htmlResp.text();
-        const $ = cheerio.load(html);
-        rawContent = $('body').html() || html;
-      }
-    } catch (e) {
-      console.error(`❌ Fetch failed for ${c.name}:`, e);
+      const response = await fetch(c.api_url || c.careers_url);
+      rawContent = await response.text();
+    } catch (err) {
+      console.error(`❌ Fetch failed for ${c.name}:`, err);
       continue;
     }
 
     const chunks = splitContentByTokenLimit(rawContent, MAX_TOKENS_PER_REQUEST, PROMPT_OVERHEAD_TOKENS);
-    console.log(`🔍 Chunked ${rawContent.length} chars into ${chunks.length} chunks for ${c.name}`);
-    
     const parsedAccumulator = [];
 
     for (const chunk of chunks) {
       const fullPrompt = buildBatchPrompt(chunk);
       const totalTokens = tokenCount(fullPrompt);
-
       if (totalTokens > MAX_TOKENS_PER_REQUEST) {
-        console.warn(`⚠️ Skipping chunk for ${c.name} — ${totalTokens} tokens exceeds ${MAX_TOKENS_PER_REQUEST}`);
+        console.warn(`⚠️ Skipping chunk for ${c.name} — ${totalTokens} tokens`);
         continue;
       }
 
       while (!rateLimiter.canSend()) {
-        console.log('⏳ Rate limit reached, waiting...');
-        await new Promise(res => setTimeout(res, 1000));
+        console.log('⏳ Rate limit hit, waiting...');
+        await new Promise(r => setTimeout(r, 1000));
       }
       rateLimiter.record();
 
-      let llmOutput = '';
       try {
         const comp = await groq.chat.completions.create({
           model: MODEL,
           messages: [{ role: 'user', content: fullPrompt }],
         });
-        llmOutput = comp.choices?.[0]?.message?.content || '';
-      } catch (e) {
-        console.error(`❌ LLM parse failed for ${c.name}:`, e);
+        const llmOutput = comp.choices?.[0]?.message?.content || '';
+        const cleaned = cleanResponse(llmOutput);
+        if (cleaned.startsWith('[')) parsedAccumulator.push(...JSON.parse(cleaned));
+      } catch (err) {
+        console.error(`❌ LLM parse failed for ${c.name}:`, err);
         break;
-      }
-
-      const cleaned = cleanResponse(llmOutput);
-      if (cleaned.startsWith('[')) {
-        try {
-          parsedAccumulator.push(...JSON.parse(cleaned));
-        } catch {
-          // Skip malformed JSON
-        }
       }
     }
 
@@ -202,38 +172,29 @@ async function main() {
     for (const job of parsedAccumulator) {
       if (!job.url) continue;
       const normUrl = normalizeUrl(job.url);
-      if (!jobMap.has(normUrl)) {
-        jobMap.set(normUrl, { ...job, url: normUrl });
-      }
+      if (!jobMap.has(normUrl)) jobMap.set(normUrl, { ...job, url: normUrl });
     }
+
     const uniqueJobs = Array.from(jobMap.values());
-
-    const { data: existing } = await supabase
-      .from('job_posts')
-      .select('url')
-      .eq('company_id', c.id);
+    const { data: existing } = await supabase.from('job_posts').select('url').eq('company_id', c.id);
     const seen = new Set((existing || []).map(r => normalizeUrl(r.url)));
-
     const jobsToInsert = uniqueJobs.filter(job => !seen.has(job.url));
 
     if (jobsToInsert.length > 0) {
-      const { error: insertError } = await supabase
-        .from('job_posts')
-        .insert(
-          jobsToInsert.map(job => ({
-            company_id: c.id,
-            company_name: c.name,
-            url: job.url,
-            title: job.title ?? null,
-            location: job.location ?? null,
-            posted_date: job.posted_date ?? null,
-            summary: job.summary ?? null,
-            seen_at: new Date().toISOString(),
-          }))
-        );
-      if (insertError) {
-        console.error(`❌ Insert error for ${c.name}:`, insertError);
-      } else {
+      const { error: insertError } = await supabase.from('job_posts').insert(
+        jobsToInsert.map(job => ({
+          company_id: c.id,
+          company_name: c.name,
+          url: job.url,
+          title: job.title ?? null,
+          location: job.location ?? null,
+          posted_date: job.posted_date ?? null,
+          summary: job.summary ?? null,
+          seen_at: new Date().toISOString(),
+        }))
+      );
+
+      if (!insertError) {
         newJobs.push(...jobsToInsert.map(job => ({
           company: c.name,
           title: job.title,
@@ -241,19 +202,16 @@ async function main() {
           posted_date: job.posted_date,
         })));
         console.log(`   ➕ Inserted ${jobsToInsert.length} new jobs for ${c.name}`);
+      } else {
+        console.error(`❌ Insert error for ${c.name}:`, insertError);
       }
     }
 
-    await supabase
-      .from('companies')
-      .update({ last_scraped: new Date().toISOString() })
-      .eq('id', c.id);
+    await supabase.from('companies').update({ last_scraped: new Date().toISOString() }).eq('id', c.id);
   }
 
   if (newJobs.length) {
-    const details = newJobs
-      .map(j => `Company: ${j.company}\nTitle: ${j.title}\nURL: ${j.url}\nPosted: ${j.posted_date ?? 'Unknown'}\n`)
-      .join('\n');
+    const details = newJobs.map(j => `Company: ${j.company}\nTitle: ${j.title}\nURL: ${j.url}\nPosted: ${j.posted_date ?? 'Unknown'}\n`).join('\n');
     try {
       await transporter.sendMail({
         from: `"Notifier" <${process.env.EMAIL_USER}>`,
