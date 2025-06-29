@@ -7,7 +7,7 @@ import nodemailer from 'nodemailer';
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL;
-const CHUNK_SIZE = 15_000;
+const CHUNK_SIZE = 18_000;
 
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
@@ -18,11 +18,6 @@ const transporter = nodemailer.createTransport({
     pass: process.env.EMAIL_PASS,
   },
 });
-
-// Loosened normalization: only lowercases and trims
-function normalizeUrlLoosely(url) {
-  return url ? url.trim().toLowerCase() : '';
-}
 
 function buildBatchPrompt(content) {
   return `
@@ -46,7 +41,7 @@ JSON:
 }
 
 function cleanResponse(text) {
-  return text.replace(/``````/g, '').trim();
+  return text.replace(/```(?:json)?/g, '').replace(/```/g, '').trim();
 }
 
 async function main() {
@@ -117,78 +112,58 @@ async function main() {
         }
       }
     }
-    console.log(`🔎 Parsed ${parsedAccumulator.length} jobs for ${c.name}`);
 
-    // 4. Loosened deduplication by normalized URL (lowercase + trim only)
-    const jobMap = new Map();
-    for (const job of parsedAccumulator) {
-      if (!job.url) continue;
-      const normUrl = normalizeUrlLoosely(job.url);
-      if (!jobMap.has(normUrl)) {
-        jobMap.set(normUrl, { ...job, url: normUrl });
-      }
-    }
-    const uniqueJobs = Array.from(jobMap.values());
-    console.log(`🗂️ ${uniqueJobs.length} unique jobs for ${c.name} after deduplication`);
+    // Deduplicate by URL
+    const uniqueJobs = Array.from(
+      parsedAccumulator.reduce((m, job) => {
+        if (job.url) m.set(job.url, job);
+        return m;
+      }, new Map()).values()
+    );
 
-    // 5. Fetch and normalize existing URLs
+    // 4. Fetch existing URLs
     const { data: existing } = await supabase
       .from('job_posts')
       .select('url')
       .eq('company_id', c.id);
-    const seen = new Set((existing || []).map(r => normalizeUrlLoosely(r.url)));
+    const seen = new Set(existing?.map(r => r.url));
 
-    // 6. Insert new jobs, handling unique constraint
+    // 5. Insert new jobs
     for (const job of uniqueJobs) {
-      const normUrl = job.url;
-      if (!normUrl || seen.has(normUrl)) continue;
-      try {
-        const { data: ins, error: ie } = await supabase
-          .from('job_posts')
-          .insert({
-            company_id:   c.id,
-            company_name: c.name,
-            url:          normUrl,
-            title:        job.title ?? null,
-            location:     job.location ?? null,
-            posted_date:  job.posted_date ?? null,
-            summary:      job.summary ?? null,
-            seen_at:      new Date().toISOString(),
-          })
-          .select('title, url, posted_date')
-          .single();
-        if (!ie && ins) {
-          newJobs.push({
-            company:     c.name,
-            title:       ins.title,
-            url:         ins.url,
-            posted_date: ins.posted_date,
-          });
-          seen.add(normUrl); // Add to set to prevent duplicates in this run
-          console.log(`   ➕ New job: ${ins.title}`);
-        } else if (ie && ie.code === '23505') {
-          // Unique constraint violation, ignore
-          continue;
-        } else if (ie) {
-          // Other errors
-          console.error(`Insert error for ${c.name}:`, ie);
-        }
-      } catch (e) {
-        if (e.code === '23505') {
-          continue;
-        }
-        console.error(`Insert exception for ${c.name}:`, e);
+      if (!job.url || seen.has(job.url)) continue;
+      const { data: ins, error: ie } = await supabase
+        .from('job_posts')
+        .insert({
+          company_id:   c.id,
+          company_name: c.name,
+          url:          job.url,
+          title:        job.title ?? null,
+          location:     job.location ?? null,
+          posted_date:  job.posted_date ?? null,
+          summary:      job.summary ?? null,
+          seen_at:      new Date().toISOString(),
+        })
+        .select('title, url, posted_date')
+        .single();
+      if (!ie && ins) {
+        newJobs.push({
+          company:     c.name,
+          title:       ins.title,
+          url:         ins.url,
+          posted_date: ins.posted_date,
+        });
+        console.log(`   ➕ New job: ${ins.title}`);
       }
     }
 
-    // 7. Update last_scraped
+    // 6. Update last_scraped
     await supabase
       .from('companies')
       .update({ last_scraped: new Date().toISOString() })
       .eq('id', c.id);
   }
 
-  // 8. Send summary email
+  // 7. Send summary email
   if (newJobs.length) {
     console.log(`🆕 Sending email for ${newJobs.length} new jobs`);
     const details = newJobs
