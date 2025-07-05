@@ -51,17 +51,18 @@ function splitContentByTokenLimit(content, maxTokens, promptTokens = 300) {
   return chunks;
 }
 
-function normalizeUrl(url) {
+// ✅ Stronger URL normalization
+function normalizeUrl(raw) {
   try {
-    const u = new URL(url.trim().toLowerCase());
-    u.hash = '';
-    u.searchParams.forEach((_, key) => {
-      if (key.startsWith('utm_')) u.searchParams.delete(key);
-    });
-    u.pathname = u.pathname.replace(/\/+$|\/+(?=\?)/g, '');
-    return u.toString();
+    const u = new URL(raw.trim());
+    u.protocol = 'https:'; // force HTTPS
+    u.hostname = u.hostname.replace(/^www\./i, '');
+    u.search = ''; // drop all query params
+    u.hash = '';   // drop fragments
+    u.pathname = u.pathname.replace(/\/+$/, '') || '/'; // remove trailing slashes
+    return `https://${u.hostname}${u.pathname}`.toLowerCase();
   } catch {
-    return url.trim().toLowerCase();
+    return raw.trim().toLowerCase();
   }
 }
 
@@ -97,8 +98,8 @@ async function main() {
   const PROMPT_OVERHEAD_TOKENS = 300;
 
   const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
   );
 
   const transporter = nodemailer.createTransport({
@@ -175,23 +176,30 @@ async function main() {
     }
 
     const uniqueJobs = Array.from(jobMap.values());
+
     const { data: existing } = await supabase.from('job_posts').select('url').eq('company_id', c.id);
     const seen = new Set((existing || []).map(r => normalizeUrl(r.url)));
     const jobsToInsert = uniqueJobs.filter(job => !seen.has(job.url));
 
     if (jobsToInsert.length > 0) {
-      const { error: insertError } = await supabase.from('job_posts').insert(
-        jobsToInsert.map(job => ({
-          company_id: c.id,
-          company_name: c.name,
-          url: job.url,
-          title: job.title ?? null,
-          location: job.location ?? null,
-          posted_date: job.posted_date ?? null,
-          summary: job.summary ?? null,
-          seen_at: new Date().toISOString(),
-        }))
-      );
+      const { error: insertError } = await supabase
+        .from('job_posts')
+        .upsert(
+          jobsToInsert.map(job => ({
+            company_id: c.id,
+            company_name: c.name,
+            url: job.url,
+            title: job.title ?? null,
+            location: job.location ?? null,
+            posted_date: job.posted_date ?? null,
+            summary: job.summary ?? null,
+            seen_at: new Date().toISOString(),
+          })),
+          {
+            onConflict: ['company_id', 'url'],
+            ignoreDuplicates: true,
+          }
+        );
 
       if (!insertError) {
         newJobs.push(...jobsToInsert.map(job => ({
