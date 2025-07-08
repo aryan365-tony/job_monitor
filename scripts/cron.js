@@ -1,7 +1,7 @@
 /*************************************************************************************************
  *  Job Monitoring & Parsing System
  *  ----------------------------------------------------------------------------------------------
- *  • Format-agnostic (HTML or API/JSON) job extraction
+ *  • Format-agnostic (HTML or JSON/API) job extraction
  *  • Two-stage, hierarchical workflow
  *  • Schema-agnostic, adaptive field mapping
  *  • Robust Groq usage: smart chunking, exponential back-off, content-type routing
@@ -19,7 +19,6 @@
  *************************************************************************************************/
 
 import { Groq } from 'groq-sdk';
-import * as cheerio from 'cheerio';
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from 'nodemailer';
@@ -27,21 +26,31 @@ import { encode, decode } from 'gpt-3-encoder';
 
 /* ════════════════════════════════════════  UTILITIES  ════════════════════════════════════════ */
 
-const MAX_TOKENS_PER_REQUEST = 2000;      // model-specific context limit
+const DEFAULT_CONTEXT_WINDOW = 8192;      // fallback if model metadata unavailable
 const PROMPT_OVERHEAD_TOKENS  = 300;      // allowance for system/user prompts
-const CHUNK_OVERLAP_TOKENS    = 100;      // 5–10 % overlap to preserve context
+const CHUNK_OVERLAP_TOKENS    = 100;      // overlap between chunks
 
-function splitIntoTokenChunks(text, maxTokens = MAX_TOKENS_PER_REQUEST) {
-  const tokens        = encode(text);
-  const effectiveSize = maxTokens - PROMPT_OVERHEAD_TOKENS;
-  const chunks        = [];
-  let start           = 0;
+async function getModelContextWindow(groq, modelId) {
+  try {
+    const { data } = await groq.models.list();
+    const meta = data.find(m => m.id === modelId);
+    return meta?.max_input_tokens || DEFAULT_CONTEXT_WINDOW;
+  } catch {
+    return DEFAULT_CONTEXT_WINDOW;
+  }
+}
+
+function splitIntoTokenChunks(text, contextWindow, promptOverhead = PROMPT_OVERHEAD_TOKENS, overlap = CHUNK_OVERLAP_TOKENS) {
+  const tokens      = encode(text);
+  const maxPerChunk = contextWindow - promptOverhead;
+  const chunks      = [];
+  let start         = 0;
 
   while (start < tokens.length) {
-    const end   = Math.min(start + effectiveSize, tokens.length);
+    const end = Math.min(start + maxPerChunk, tokens.length);
     chunks.push(decode(tokens.slice(start, end)));
     if (end === tokens.length) break;
-    start = end - CHUNK_OVERLAP_TOKENS;
+    start = Math.max(0, end - overlap);
   }
   return chunks;
 }
@@ -49,102 +58,106 @@ function splitIntoTokenChunks(text, maxTokens = MAX_TOKENS_PER_REQUEST) {
 function normalizeUrl(raw) {
   try {
     const u = new URL(raw.trim());
-    u.protocol = 'https:';            // force HTTPS
+    u.protocol = 'https:';
     u.hostname = u.hostname.replace(/^www\./i, '');
     u.search   = '';
     u.hash     = '';
     u.pathname = u.pathname.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
     return `https://${u.hostname}${u.pathname}`.toLowerCase();
-  } catch { return raw.trim().toLowerCase(); }
+  } catch {
+    return raw.trim().toLowerCase();
+  }
 }
 
 /* ════════════════════════════════════════  RATE LIMITER  ═════════════════════════════════════ */
 
 class RateLimiter {
-  constructor(maxPerMinute = 30, maxPerDay = 14400, minIntervalMs = 3500) {
-    this.maxPerMinute   = maxPerMinute;
-    this.maxPerDay      = maxPerDay;
-    this.minIntervalMs  = minIntervalMs;
-    this.thisMinute     = 0;
-    this.today          = 0;
-    this.minuteStart    = Date.now();
-    this.dayStart       = Date.now();
-    this.lastRequest    = 0;
+  constructor(maxTokensPerMinute = 10000, maxRequestsPerMinute = 30, minIntervalMs = 2000) {
+    this.maxTokensPerMinute   = maxTokensPerMinute;
+    this.maxRequestsPerMinute = maxRequestsPerMinute;
+    this.minIntervalMs        = minIntervalMs;
+    this.tokensThisMinute     = 0;
+    this.requestsThisMinute   = 0;
+    this.minuteStart          = Date.now();
+    this.lastRequestTime      = 0;
   }
-  resetMinute() { this.thisMinute = 0; this.minuteStart = Date.now(); }
-  resetDay()    { this.today      = 0; this.dayStart   = Date.now(); }
-  async waitTurn() {
+
+  resetIfNeeded() {
     const now = Date.now();
-    if (now - this.minuteStart > 60_000) this.resetMinute();
-    if (now - this.dayStart    > 86_400_000) this.resetDay();
-
-    const elapsed = now - this.lastRequest;
-    if (elapsed < this.minIntervalMs)
-      await new Promise(r => setTimeout(r, this.minIntervalMs - elapsed));
-
-    if (this.thisMinute >= this.maxPerMinute || this.today >= this.maxPerDay)
-      await new Promise(r => setTimeout(r, 1_000));   // simple throttle loop
+    if (now - this.minuteStart >= 60_000) {
+      this.tokensThisMinute     = 0;
+      this.requestsThisMinute   = 0;
+      this.minuteStart          = now;
+    }
   }
-  record() {
-    this.thisMinute++;  this.today++;  this.lastRequest = Date.now();
+
+  async waitTurn(tokensNeeded) {
+    this.resetIfNeeded();
+    const now      = Date.now();
+    const elapsed  = now - this.lastRequestTime;
+    if (elapsed < this.minIntervalMs) {
+      await new Promise(r => setTimeout(r, this.minIntervalMs - elapsed));
+    }
+    while (
+      this.tokensThisMinute + tokensNeeded > this.maxTokensPerMinute ||
+      this.requestsThisMinute >= this.maxRequestsPerMinute
+    ) {
+      await new Promise(r => setTimeout(r, 100));
+      this.resetIfNeeded();
+    }
+  }
+
+  record(tokensUsed = 0) {
+    this.tokensThisMinute   += tokensUsed;
+    this.requestsThisMinute += 1;
+    this.lastRequestTime     = Date.now();
   }
 }
 
 /* ════════════════════════════════════════  GROQ HELPERS  ══════════════════════════════════════ */
 
-async function chatOnce(groq, model, content, rateLimiter, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    await rateLimiter.waitTurn();
-    try {
-      rateLimiter.record();
-      const res = await groq.chat.completions.create({
-        model,
-        messages: [{ role: 'user', content }],
-      });
-      return (res.choices?.[0]?.message?.content || '').trim();
-    } catch (err) {
-      const isCtx = err?.message?.includes('context_length_exceeded');
-      if (isCtx) throw err;      // let caller decide to re-chunk
-      if (i === retries - 1) throw err;
-      const backoff = Math.min(1_000 * 2 ** i, 30_000);
-      console.warn(`Groq error. Retry ${i + 1}/${retries} in ${backoff}ms`);
-      await new Promise(r => setTimeout(r, backoff));
-    }
+async function chatOnce(groq, model, content, limiter, contextWindow) {
+  const tokensEstimate = encode(content).length;
+  await limiter.waitTurn(tokensEstimate);
+  try {
+    limiter.record(tokensEstimate);
+    const res = await groq.chat.completions.create({
+      model,
+      messages: [{ role: 'user', content }],
+    });
+    return (res.choices[0]?.message?.content || '').trim();
+  } catch (err) {
+    throw err;
   }
 }
 
 /* ════════════════════════════════════════  LLM PROMPTS  ═══════════════════════════════════════ */
 
 const PROMPT_STAGE1 = text => `
-You are an expert parser. The following content can be HTML, JSON, or plain text.
-Task: Extract every *distinct* job-posting URL you can find.
-Return a JSON array of canonical absolute URLs—nothing else.
+You are an expert parser. The following content (HTML, JSON, or plain text) contains job listings.
+Task: Extract all distinct job-posting URLs.
+Return a JSON array of absolute URLs only.
 
-CONTENT ↓↓↓
+CONTENT:
 ${text}
 `;
 
 const PROMPT_STAGE2 = text => `
-You are an expert job parser. The input below (HTML, JSON, or text) represents *one*
-job posting. Extract all relevant info *without assuming field names*.
-Return a single JSON object with keys you infer, mapping to:
-  url           title           location
-  posted_date   description     department
-  employment_type  salary       etc.
+You are an expert job parser. The input below (HTML, JSON, or text) represents one job posting.
+Extract all relevant fields (e.g., title, location, posted_date, description), without assuming specific field names.
+Return a JSON object with your inferred keys. Omit any missing fields.
 
-If a field isn't present, omit the key. Use ISO date when possible.
-
-CONTENT ↓↓↓
+CONTENT:
 ${text}
+
 JSON OBJECT:
 `;
 
 /* ════════════════════════════════════════  MAIN WORKFLOW  ═════════════════════════════════════ */
 
 async function main() {
-  console.log('🚀  Job monitor start:', new Date().toISOString());
+  console.log('🚀 Job monitor start:', new Date().toISOString());
 
-  /* INITIALISE SERVICES */
   const groq   = new Groq({ apiKey: process.env.GROQ_API_KEY });
   const MODEL  = process.env.GROQ_MODEL;
   const sb     = createClient(
@@ -157,135 +170,134 @@ async function main() {
     secure: false,
     auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
   });
-  const limiter = new RateLimiter();
 
-  /* FETCH COMPANIES TO SCRAPE */
-  const { data: companies, error: cErr } =
-    await sb.from('companies').select('*').order('name');
+  const limiter       = new RateLimiter();
+  const contextWindow = await getModelContextWindow(groq, MODEL);
+
+  // Fetch companies
+  const { data: companies, error: cErr } = await sb.from('companies').select('*').order('name');
   if (cErr) throw cErr;
 
-  const oneHourAgo = new Date(Date.now() - 3_600_000).toISOString();
-  const newJobs    = [];
+  const cutoff   = new Date(Date.now() - 3_600_000).toISOString();
+  const newJobs  = [];
 
-  /* ──────────────────────────  LOOP OVER COMPANIES  ────────────────────────── */
   for (const c of companies) {
-    if (c.last_scraped && c.last_scraped >= oneHourAgo) {
-      console.log(`⏭️  Skipping ${c.name} (recent)`);
+    if (c.last_scraped && c.last_scraped >= cutoff) {
+      console.log(`⏭️ Skipping ${c.name} (recent)`);
       continue;
     }
-    console.log(`🔍  Scraping ${c.name}`);
+    console.log(`🔍 Scraping ${c.name}`);
 
-    /* 1️⃣  DOWNLOAD CAREERS PAGE OR API */
+    // 1. Fetch raw content
     let raw;
     try {
       const res = await fetch(c.api_url || c.careers_url);
       raw       = await res.text();
     } catch (e) {
-      console.error(`❌  Fetch failed for ${c.name}:`, e);
+      console.error(`❌ Fetch failed for ${c.name}:`, e);
       continue;
     }
 
-    /* 2️⃣  STAGE-1: EXTRACT JOB URLs (format-agnostic) */
-    const urlChunks = splitIntoTokenChunks(raw);
+    // 2. Stage 1: Extract job URLs
+    const urlChunks = splitIntoTokenChunks(raw, contextWindow);
     const jobUrls   = new Set();
-
     for (const chunk of urlChunks) {
       try {
-        const out = await chatOnce(groq, MODEL, PROMPT_STAGE1(chunk), limiter);
+        const out = await chatOnce(groq, MODEL, PROMPT_STAGE1(chunk), limiter, contextWindow);
         const arr = JSON.parse(out.startsWith('[') ? out : '[]');
         arr.forEach(u => jobUrls.add(normalizeUrl(u)));
       } catch (err) {
-        console.warn(`⚠️  URL extraction chunk failed for ${c.name}`, err);
+        console.warn(`⚠️ URL extraction failed for ${c.name}`, err);
       }
     }
+
     if (!jobUrls.size) {
-      console.log(`ℹ️  No URLs found for ${c.name}`);
-      await sb.from('companies').update({ last_scraped: new Date().toISOString() })
-               .eq('id', c.id);
+      console.log(`ℹ️ No URLs found for ${c.name}`);
+      await sb.from('companies').update({ last_scraped: new Date().toISOString() }).eq('id', c.id);
       continue;
     }
 
-    /* 3️⃣  FILTER ALREADY SEEN URLs */
-    const { data: seenRows } =
-      await sb.from('job_posts').select('url').eq('company_id', c.id);
-    const seenSet   = new Set((seenRows || []).map(r => normalizeUrl(r.url)));
-    const toProcess = Array.from(jobUrls).filter(u => !seenSet.has(u));
-
+    // 3. Filter seen URLs
+    const { data: seenRows } = await sb.from('job_posts').select('url').eq('company_id', c.id);
+    const seenSet           = new Set((seenRows || []).map(r => normalizeUrl(r.url)));
+    const toProcess         = Array.from(jobUrls).filter(u => !seenSet.has(u));
     if (!toProcess.length) {
-      console.log(`ℹ️  No new jobs for ${c.name}`);
-      await sb.from('companies').update({ last_scraped: new Date().toISOString() })
-               .eq('id', c.id);
+      console.log(`ℹ️ No new jobs for ${c.name}`);
+      await sb.from('companies').update({ last_scraped: new Date().toISOString() }).eq('id', c.id);
       continue;
     }
 
-    /* 4️⃣  STAGE-2: PROCESS EACH NEW JOB PAGE */
+    // 4. Stage 2: Parse each job page
     for (const jobUrl of toProcess) {
       let jobRaw;
       try {
         const res = await fetch(jobUrl);
         jobRaw    = await res.text();
       } catch {
-        console.warn(`⚠️  Fetch failed for job URL: ${jobUrl}`);
+        console.warn(`⚠️ Fetch failed for job URL: ${jobUrl}`);
         continue;
       }
 
-      const chunks = splitIntoTokenChunks(jobRaw);
+      const chunks    = splitIntoTokenChunks(jobRaw, contextWindow);
       const assembled = {};
 
       for (const chunk of chunks) {
         try {
-          const out = await chatOnce(groq, MODEL, PROMPT_STAGE2(chunk), limiter);
+          const out = await chatOnce(groq, MODEL, PROMPT_STAGE2(chunk), limiter, contextWindow);
           const obj = JSON.parse(out.startsWith('{') ? out : '{}');
-          Object.assign(assembled, obj);           // merge partials
+          Object.assign(assembled, obj);
         } catch (err) {
-          console.warn(`⚠️  Job parse chunk failed (${jobUrl})`, err);
+          console.warn(`⚠️ Job parse failed (${jobUrl})`, err);
         }
       }
-      assembled.url        = jobUrl;
-      assembled.company_id = c.id;
-      assembled.seen_at    = new Date().toISOString();
-      assembled.company_name = c.name;
 
-      /* 5️⃣  UPSERT INTO SUPABASE */
+      Object.assign(assembled, {
+        url:           jobUrl,
+        company_id:    c.id,
+        company_name:  c.name,
+        seen_at:       new Date().toISOString(),
+      });
+
       try {
         await sb.from('job_posts').upsert(assembled, {
-          onConflict: ['company_id', 'url'],
+          onConflict:     ['company_id', 'url'],
           ignoreDuplicates: true,
         });
         newJobs.push(assembled);
-        console.log(`   ➕  ${c.name}: ${assembled.title || '(title missing)'}`);
+        console.log(`➕ ${c.name}: ${assembled.title || '(no title)'}`);
       } catch (e) {
-        console.error(`❌  Insert error for ${jobUrl}`, e);
+        console.error(`❌ Insert error for ${jobUrl}`, e);
       }
     }
 
-    /* 6️⃣  MARK COMPANY SCRAPED */
-    await sb.from('companies').update({ last_scraped: new Date().toISOString() })
-             .eq('id', c.id);
+    // 5. Update last_scraped
+    await sb.from('companies').update({ last_scraped: new Date().toISOString() }).eq('id', c.id);
   }
 
-  /* 7️⃣  EMAIL NOTIFICATION */
+  // 6. Send notification if new jobs found
   if (newJobs.length) {
     const body = newJobs.map(j =>
       `${j.company_name}\n${j.title || ''}\n${j.url}\n${j.posted_date || ''}\n`
     ).join('\n');
     try {
       await mailer.sendMail({
-        from: `"Job Monitor" <${process.env.EMAIL_USER}>`,
-        to:   process.env.NOTIFY_EMAIL,
+        from:    `"Job Monitor" <${process.env.EMAIL_USER}>`,
+        to:      process.env.NOTIFY_EMAIL,
         subject: `🆕 ${newJobs.length} new job${newJobs.length > 1 ? 's' : ''}`,
-        text: body,
+        text:     body,
       });
-      console.log('📧  Email sent');
-    } catch (e) { console.error('❌  Email error', e); }
-  } else { console.log('ℹ️  No new jobs discovered'); }
+      console.log('📧 Email sent');
+    } catch (e) {
+      console.error('❌ Email send failed', e);
+    }
+  } else {
+    console.log('ℹ️ No new jobs discovered');
+  }
 
-  console.log('✅  Job monitor end:', new Date().toISOString());
+  console.log('✅ Job monitor end:', new Date().toISOString());
 }
 
-/* ════════════════════════════════════════  EXECUTE  ═══════════════════════════════════════════ */
-
 main().catch(err => {
-  console.error('💥  Fatal error:', err);
+  console.error('💥 Fatal error:', err);
   process.exit(1);
 });
