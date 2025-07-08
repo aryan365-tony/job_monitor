@@ -53,7 +53,7 @@ function normalizeUrl(raw) {
     u.hostname = u.hostname.replace(/^www\./i, '');
     u.search   = '';
     u.hash     = '';
-    u.pathname = u.pathname.replace(/\\/+/g, '/').replace(/\/$/, '') || '/';
+    u.pathname = u.pathname.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
     return `https://${u.hostname}${u.pathname}`.toLowerCase();
   } catch { return raw.trim().toLowerCase(); }
 }
